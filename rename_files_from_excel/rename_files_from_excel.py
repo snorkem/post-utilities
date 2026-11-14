@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import pandas as pd
 from pathlib import Path
@@ -5,10 +7,9 @@ import sys
 import re
 import logging
 import argparse
-import shutil
 from datetime import datetime
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Iterable, List, Tuple, Optional
 
 
 @dataclass
@@ -29,15 +30,24 @@ class RenameResult:
     def get_summary(self, dry_run: bool = False) -> str:
         """Generate a human-readable summary."""
         prefix = "Dry run - " if dry_run else ""
-        verb = "would be" if dry_run else ""
+        verb = "would be " if dry_run else ""
         return (f"{prefix}Summary: {self.renamed_count} files {verb}renamed, "
                 f"{self.skipped_count} skipped (destinations exist), {self.errors_count} errors")
+
+
+class InputError(Exception):
+    """A problem with the inputs that the user has to fix; the message is shown to them."""
+
+    def __init__(self, message: str, title: str = "Input Error"):
+        super().__init__(message)
+        self.title = title
 
 
 class FileValidator:
     """Validates filenames and detects issues."""
 
-    INVALID_CHARS_PATTERN = re.compile(r"[<>/{}[\]~`]")
+    # Path separators, characters Windows forbids in names, and control characters
+    INVALID_CHARS_PATTERN = re.compile(r'[<>:"/\\|?*{}\[\]~`\x00-\x1f]')
 
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
@@ -45,7 +55,7 @@ class FileValidator:
     def validate_filename(self, filename, index: int, column_name: str) -> bool:
         """Check if filename is valid ascii characters and has no illegal path characters."""
         try:
-            if pd.isna(filename):
+            if pd.isna(filename) or not str(filename).strip():
                 error_msg = f'Empty cell in {column_name} on row {index+2}'
                 print(error_msg)
                 self.logger.error(error_msg)
@@ -86,41 +96,54 @@ class FileCollector:
 
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
+        self.unreadable_dirs: List[Path] = []
 
     def collect_files(self, target_dir: Path, recursive: bool = True) -> List[Path]:
-        """Recursively collect all non-hidden files from directory and subdirectories."""
+        """Collect non-hidden files, skipping hidden folders (e.g. .Trashes, .git).
+
+        Folders that can't be read are skipped and recorded in unreadable_dirs,
+        so one locked folder doesn't stop the rest from being collected.
+        """
         files_to_rename = []
 
         if not target_dir.is_dir():
             print('Target is not a directory')
-            if self.logger:
-                self.logger.error('Target is not a directory: %s', target_dir)
+            self.logger.error('Target is not a directory: %s', target_dir)
             return files_to_rename
 
         print(f'Target is directory: {target_dir}. Collecting files...')
-        if self.logger:
-            self.logger.info('Target is directory: %s. Collecting files...', target_dir)
+        self.logger.info('Target is directory: %s. Collecting files...', target_dir)
 
-        try:
-            if recursive:
-                # Use rglob for recursive search
-                for file_path in target_dir.rglob('*'):
-                    if file_path.is_file() and not file_path.name.startswith('.'):
-                        files_to_rename.append(file_path)
-
-            else:
-                # Use iterdir for non-recursive search
-                for file_path in target_dir.iterdir():
-                    if file_path.is_file() and not file_path.name.startswith('.'):
-                        files_to_rename.append(file_path)
-
-        except Exception as e:
-            error_msg = f'Error collecting files from {target_dir}: {str(e)}'
+        def skip_unreadable(error: OSError) -> None:
+            unreadable = Path(error.filename)
+            self.unreadable_dirs.append(unreadable)
+            error_msg = f'Skipping folder that could not be read: {unreadable} ({error.strerror})'
             print(error_msg)
-            if self.logger:
-                self.logger.error(error_msg)
+            self.logger.warning(error_msg)
+
+        # os.walk rather than Path.walk (Python 3.12+) to keep older Pythons working
+        for dir_path, dir_names, file_names in os.walk(target_dir, onerror=skip_unreadable):
+            dir_names[:] = sorted(d for d in dir_names if not d.startswith('.'))
+            files_to_rename.extend(Path(dir_path) / name
+                                   for name in sorted(file_names) if not name.startswith('.'))
+            if not recursive:
+                break
 
         return files_to_rename
+
+    def collect_from_dirs(self, target_dirs: Iterable[Path], recursive: bool = True) -> List[Path]:
+        """Collect files from several directories, listing each file only once
+        even when the directories overlap (e.g. a folder and its subfolder)."""
+        seen = set()
+        collected = []
+        for target_dir in target_dirs:
+            dir_files = self.collect_files(target_dir, recursive)
+            new_files = [f for f in dir_files if f.resolve() not in seen]
+            seen.update(f.resolve() for f in new_files)
+            collected.extend(new_files)
+            print(f"Found {len(dir_files)} files in {target_dir}"
+                  + (f" ({len(dir_files) - len(new_files)} already collected)" if len(new_files) < len(dir_files) else ""))
+        return collected
 
 
 class FileRenamer:
@@ -146,50 +169,82 @@ class FileRenamer:
 
         # Process each file
         for file_path in target_files:
-            file_name = file_path.stem
-            file_ext = file_path.suffix
+            target_name = rename_map.get(file_path.stem)
+            if target_name is None:
+                continue
 
-            if file_name in rename_map:
-                new_name = rename_map[file_name] + self.config.suffix + file_ext
-                new_path = file_path.parent / new_name
+            new_name = target_name + self.config.suffix + file_path.suffix
+            new_path = file_path.parent / new_name
+
+            try:
+                if new_path == file_path:
+                    print(f"Skipping {file_path} - already has the new name")
+                    self.logger.info(f"Skipping rename - already named: {file_path}")
+                    result.skipped_count += 1
+                    continue
+
+                destination_exists = new_path.exists()
+                if destination_exists and not self.config.force_overwrite:
+                    print(f"Skipping {file_path} - destination already exists: {new_path}")
+                    self.logger.warning(f"Skipping rename - destination exists: {new_path}")
+                    result.skipped_count += 1
+                    continue
+
+                # Simulate, reporting the same actions a real run would take
+                if self.config.dry_run:
+                    if destination_exists:
+                        print(f"Would back up existing {new_path.name} and overwrite it")
+                        self.logger.info(f"Dry run: would back up and overwrite {new_path}")
+                    print(f"Would rename: {file_path.name} -> {new_name}")
+                    self.logger.info(f"Dry run: would rename {file_path} -> {new_path}")
+                    result.renamed_count += 1
+                    continue
+
+                backup_path = None
+                if destination_exists:
+                    # Move the existing file aside rather than copying it: instant even for
+                    # huge media files, and it frees the name (Windows won't rename onto
+                    # an existing file)
+                    backup_path = self._backup_path(new_path)
+                    new_path.rename(backup_path)
+                    print(f"Backed up existing file to: {backup_path}")
+                    self.logger.info(f"Backed up existing file: {new_path} -> {backup_path}")
 
                 try:
-                    # Check if destination exists
-                    if new_path.exists():
-                        if self.config.force_overwrite and not self.config.dry_run:
-                            # If force flag is true, create a backup before overwriting
-                            backup_path = new_path.with_name(f"{new_path.stem}_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}{new_path.suffix}")
-                            shutil.copy2(new_path, backup_path)
-                            print(f"Backed up existing file to: {backup_path}")
-                            self.logger.info(f"Backed up existing file: {new_path} -> {backup_path}")
-                        else:
-                            print(f"Skipping {file_path} - destination already exists: {new_path}")
-                            self.logger.warning(f"Skipping rename - destination exists: {new_path}")
-                            result.skipped_count += 1
-                            continue
+                    file_path.rename(new_path)
+                except OSError:
+                    if backup_path is not None:
+                        # Put the original destination file back before reporting the error
+                        backup_path.rename(new_path)
+                        self.logger.info(f"Restored {new_path} from backup after failed rename")
+                    raise
 
-                    # Perform rename or simulate it
-                    if self.config.dry_run:
-                        print(f"Would rename: {file_path.name} -> {new_name}")
-                        self.logger.info(f"Dry run: would rename {file_path} -> {new_path}")
-                        result.renamed_count += 1
-                    else:
-                        file_path.rename(new_path)
-                        print(f"Renamed: {file_path.name} -> {new_path.name}")
-                        self.logger.info(f"Renamed: {file_path} -> {new_path}")
-                        result.renamed_count += 1
+                print(f"Renamed: {file_path.name} -> {new_path.name}")
+                self.logger.info(f"Renamed: {file_path} -> {new_path}")
+                result.renamed_count += 1
 
-                except Exception as e:
-                    error_msg = f"Error processing {file_path}: {str(e)}"
-                    print(error_msg)
-                    self.logger.error(error_msg)
-                    result.errors_count += 1
+            except Exception as e:
+                error_msg = f"Error processing {file_path}: {str(e)}"
+                print(error_msg)
+                self.logger.error(error_msg)
+                result.errors_count += 1
 
         summary = result.get_summary(self.config.dry_run)
         print(summary)
         self.logger.info(summary)
 
         return result
+
+    @staticmethod
+    def _backup_path(path: Path) -> Path:
+        """Unused name for a backup of path, e.g. 'B001_M_backup_20251027140501.mov'."""
+        stamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        candidate = path.with_name(f"{path.stem}_backup_{stamp}{path.suffix}")
+        counter = 1
+        while candidate.exists():
+            candidate = path.with_name(f"{path.stem}_backup_{stamp}_{counter}{path.suffix}")
+            counter += 1
+        return candidate
 
 
 class ExcelReader:
@@ -201,9 +256,9 @@ class ExcelReader:
     def check_single_sheet(self, excel_file: Path) -> Tuple[bool, Optional[str]]:
         """Check if the Excel file contains only a single sheet."""
         try:
-            # Use pandas ExcelFile to get sheet names
-            xls = pd.ExcelFile(excel_file)
-            sheet_names = xls.sheet_names
+            # Use pandas ExcelFile to get sheet names (closed afterwards so the file isn't left locked)
+            with pd.ExcelFile(excel_file) as xls:
+                sheet_names = xls.sheet_names
 
             if len(sheet_names) > 1:
                 error_msg = f"Excel file contains multiple sheets: {', '.join(sheet_names)}. Only single-sheet files are supported."
@@ -220,10 +275,67 @@ class ExcelReader:
             return False, None
 
 
+def _strip_cells(series: pd.Series) -> pd.Series:
+    """Strip stray whitespace from text cells; empty and numeric cells are left as they are."""
+    return series.map(lambda value: value.strip() if isinstance(value, str) else value)
+
+
+def load_name_mapping(excel_file: Path, files_col: str, rename_col: str,
+                      logger: logging.Logger) -> Tuple[pd.Series, pd.Series]:
+    """Read and validate the original and new filename columns from the spreadsheet.
+
+    Returns (original names, new names). Raises InputError describing the first
+    problem found, so the CLI and GUI report the same checks the same way.
+    """
+    excel_reader = ExcelReader(logger)
+    validator = FileValidator(logger)
+
+    # Check if Excel file has only one sheet
+    single_sheet, sheet_name = excel_reader.check_single_sheet(excel_file)
+    if sheet_name is None:
+        raise InputError("The Excel file could not be read.", "Excel Error")
+    if not single_sheet:
+        raise InputError("This tool only supports Excel files with a single sheet.", "Excel Error")
+
+    # Read the Excel file into dataframe
+    try:
+        df = pd.read_excel(excel_file, sheet_name=0)  # Always use first sheet
+    except Exception as e:
+        raise InputError(f"Error reading Excel file: {str(e)}", "Excel Error") from e
+    print(f"Successfully read Excel file with {len(df)} rows from sheet '{sheet_name}'")
+    logger.info(f"Successfully read Excel file with {len(df)} rows from sheet '{sheet_name}'")
+
+    # Verify required columns exist
+    for column in (files_col, rename_col):
+        if column not in df.columns:
+            raise InputError(f"Required column not found: '{column}'", "Column Error")
+
+    master_file_names = _strip_cells(df[files_col])
+    proxy_names = _strip_cells(df[rename_col])
+
+    # Validate filenames
+    invalid_rows = []
+    for index, (master_name, proxy_name) in enumerate(zip(master_file_names, proxy_names)):
+        if not validator.validate_filename(master_name, index, files_col) or \
+           not validator.validate_filename(proxy_name, index, rename_col):
+            invalid_rows.append(index + 2)  # +2 for Excel row number
+
+    if invalid_rows:
+        raise InputError(f"Invalid filenames found in rows: {', '.join(map(str, invalid_rows))}",
+                         "Validation Error")
+
+    # Check for duplicates
+    for series, column in ((master_file_names, files_col), (proxy_names, rename_col)):
+        if validator.check_duplicates(series, column):
+            raise InputError(f"Duplicate values found in '{column}' column", "Duplicate Error")
+
+    return master_file_names, proxy_names
+
+
 def setup_logger(logname='renames.log'):
     """Set up and return a logger with appropriate configuration."""
-    log_file_path = os.path.abspath(logname)
-    
+    log_file_path = str(Path(logname).resolve())
+
     logging.basicConfig(
         filename=log_file_path,
         filemode='a',
@@ -271,7 +383,7 @@ def parse_arguments():
 
     parser.add_argument('--force',
                         action='store_true',
-                        help='Overwrite existing files during rename')
+                        help='Overwrite existing files during rename (existing files are kept as backups)')
 
     parser.add_argument('--dry-run',
                         action='store_true',
@@ -288,9 +400,9 @@ def main():
     logger, log_path = setup_logger(args.log)
     print(f"Logging to: {log_path}")
 
-    # Convert string paths to Path objects and normalize them
-    excel_file = Path(os.path.abspath(args.excel_file))
-    target_dir = Path(os.path.abspath(args.target_dir))
+    # Convert string paths to absolute Path objects
+    excel_file = Path(args.excel_file).resolve()
+    target_dir = Path(args.target_dir).resolve()
 
     # Column names from arguments
     files_to_rename_col = args.files_col
@@ -318,8 +430,6 @@ def main():
 
     try:
         # Create component instances
-        excel_reader = ExcelReader(logger)
-        validator = FileValidator(logger)
         collector = FileCollector(logger)
         rename_config = RenameConfig(
             suffix=master_file_suffix,
@@ -330,86 +440,21 @@ def main():
 
         # Verify the Excel file has the correct extension
         if not excel_file.name.lower().endswith(('.xlsx', '.xls')):
-            error_msg = f"The specified file is not an Excel file (.xlsx or .xls): {excel_file}"
-            print(error_msg)
-            logger.error(error_msg)
-            sys.exit(1)
+            raise InputError(f"The specified file is not an Excel file (.xlsx or .xls): {excel_file}")
 
         # Verify the Excel file exists
         if not excel_file.exists():
-            error_msg = f"The specified Excel file does not exist: {excel_file}"
-            print(error_msg)
-            logger.error(error_msg)
-            sys.exit(1)
+            raise InputError(f"The specified Excel file does not exist: {excel_file}")
 
-        # Check if Excel file has only one sheet
-        single_sheet, sheet_name = excel_reader.check_single_sheet(excel_file)
-        if not single_sheet:
-            error_msg = "This script only supports Excel files with a single sheet."
-            print(error_msg)
-            logger.error(error_msg)
-            sys.exit(1)
-
-        # Read the Excel file into dataframe
-        try:
-            df = pd.read_excel(excel_file, sheet_name=0)  # Always use first sheet
-            print(f"Successfully read Excel file with {len(df)} rows from sheet '{sheet_name}'")
-            logger.info(f"Successfully read Excel file with {len(df)} rows from sheet '{sheet_name}'")
-        except Exception as e:
-            error_msg = f"Error reading Excel file: {str(e)}"
-            print(error_msg)
-            logger.error(error_msg)
-            sys.exit(1)
-
-        # Verify required columns exist
-        if files_to_rename_col not in df.columns:
-            error_msg = f"Required column not found: '{files_to_rename_col}'"
-            print(error_msg)
-            logger.error(error_msg)
-            sys.exit(1)
-
-        if rename_to_col not in df.columns:
-            error_msg = f"Required column not found: '{rename_to_col}'"
-            print(error_msg)
-            logger.error(error_msg)
-            sys.exit(1)
-
-        # Define columns from spreadsheet to pull from by their headers.
-        proxy_names = df[rename_to_col]
-        master_file_names = df[files_to_rename_col]
-
-        # Validate filenames
-        invalid_rows = []
-        for index, (master_name, proxy_name) in enumerate(zip(master_file_names, proxy_names)):
-            if not validator.validate_filename(master_name, index, files_to_rename_col) or \
-               not validator.validate_filename(proxy_name, index, rename_to_col):
-                invalid_rows.append(index + 2)  # +2 for Excel row number
-
-        if invalid_rows:
-            error_msg = f"Invalid filenames found in rows: {', '.join(map(str, invalid_rows))}"
-            print(error_msg)
-            logger.error(error_msg)
-            sys.exit(1)
-
-        # Check for duplicates
-        if validator.check_duplicates(master_file_names, files_to_rename_col):
-            sys.exit(1)
-
-        if validator.check_duplicates(proxy_names, rename_to_col):
-            sys.exit(1)
+        master_file_names, proxy_names = load_name_mapping(
+            excel_file, files_to_rename_col, rename_to_col, logger)
 
         # Verify target directory exists
         if not target_dir.exists():
-            error_msg = f"Target directory does not exist: {target_dir}"
-            print(error_msg)
-            logger.error(error_msg)
-            sys.exit(1)
+            raise InputError(f"Target directory does not exist: {target_dir}")
 
         if not target_dir.is_dir():
-            error_msg = f"Target is not a directory: {target_dir}"
-            print(error_msg)
-            logger.error(error_msg)
-            sys.exit(1)
+            raise InputError(f"Target is not a directory: {target_dir}")
 
         # Collect files to process
         files_to_rename = collector.collect_files(target_dir, recursive)
@@ -421,6 +466,11 @@ def main():
 
         # Perform renaming
         renamer.rename_files(files_to_rename, master_file_names, proxy_names)
+
+    except InputError as e:
+        print(str(e))
+        logger.error(str(e))
+        sys.exit(1)
 
     except Exception as e:
         error_msg = f"Error: {str(e)}"
